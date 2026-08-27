@@ -1,0 +1,12 @@
+# Los batch de Windows EXIGEN CRLF. Con LF, cmd.exe no los ejecuta:
+# el sintoma es "no se reconoce como un comando interno o externo".
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# El resto normalizado en el repo, sin sorpresas al clonar.
+*.py   text eol=lf
+*.md   text eol=lf
+*.ts   text eol=lf
+*.json text eol=lf
+*.cpp  text eol=lf
+*.ini  text eol=lf

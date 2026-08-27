@@ -1,29 +1,28 @@
 """
 KIRA — Puente entre el ESP32 y el orquestador de agentes (eve).
 
-UN SOLO PROCESO. Es dueno del puerto serie de principio a fin.
-`listen.py` y `speak.py` no podian convivir porque los dos abrian
-COM en exclusiva; este script los sustituye para el ciclo completo.
+UN SOLO PROCESO, dueno del puerto serie de principio a fin. Dos procesos no
+pueden compartir el puerto COM, asi que todo el ciclo vive aqui.
 
 Ciclo:
 
-    INMP441 -> ESP32 -> frames "AA 55" -> faster-whisper (local)
-      -> wake word "Oye Kira" -> POST a eve -> orquestador
+    INMP441 -> ESP32 -> frames "AA 55" -> faster-whisper (STT local)
+      -> wake word "Oye Kira" -> POST a eve -> agente raiz
       -> subagente -> texto -> SAPI5 + FFmpeg -> PCM 16 kHz
       -> protocolo v2 -> ESP32 -> MAX98357A -> parlante
 
-Protocolos (ver seccion 6 de CLAUDE.md):
+Protocolos: ver seccion 6 de CLAUDE.md.
 
-    ESP32 -> PC:  0xAA 0x55 TIPO LEN_LO LEN_HI payload   (audio del mic)
-    PC -> ESP32:  0xA5 0x5A CMD SEQ LEN_LO LEN_HI payload CK   (audio a reproducir)
+    ESP32 -> PC:  0xAA 0x55 TIPO LEN_LO LEN_HI payload        (audio del mic)
+    PC -> ESP32:  0xA5 0x5A CMD SEQ LEN_LO LEN_HI payload CK  (audio a reproducir)
     ESP32 -> PC:  tokens de 1 byte (2 para ACK: 0x06 + SEQ)
 
-Requiere: pyserial, comtypes, faster-whisper, FFmpeg en el PATH,
-y el servidor de eve corriendo (por defecto en 127.0.0.1:2000).
+Requiere: pyserial, comtypes, faster-whisper, FFmpeg en el PATH, y el
+servidor de eve corriendo.
 
-No usa pydub (Python 3.13 ya no trae audioop).
-No usa pyttsx3: su driver SAPI5 se cuelga en el segundo
-runAndWait() del mismo proceso, y este script habla en bucle.
+No usa pydub: Python 3.13 elimino audioop.
+No usa pyttsx3: su driver SAPI5 se cuelga en el segundo runAndWait() del
+mismo proceso, y este script habla en bucle.
 """
 
 import json
@@ -64,8 +63,17 @@ SAMPLE_RATE = 16000
 # Debe coincidir con MAX_PAYLOAD del firmware.
 CHUNK_BYTES = 1024
 
-# Servidor de eve. En desarrollo `eve dev` escucha en 2000.
+# Servidor de eve. `eve dev` escucha en 2000; en produccion `eve start`
+# usa el puerto que se le pase por PORT.
 EVE_URL = os.environ.get("KIRA_EVE_URL", "http://127.0.0.1:2000")
+
+# Ruta del .env.local del agente. Es la UNICA copia del token: el puente lo
+# lee de ahi en vez de tener el secreto duplicado en dos sitios.
+EVE_ENV_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "brain",
+    ".env.local",
+)
 
 # Reusar la misma sesion de eve entre frases da memoria de
 # conversacion gratis: eve la mantiene durable del lado servidor.
@@ -85,58 +93,27 @@ VOICE_RATE = 0
 
 # Cadena de FFmpeg para subir el volumen de la voz.
 #
-# La voz de SAPI sale a unos -22 dBFS de RMS, que en un parlante
-# de 40 mm se oye bajita. Medido con "Quito es la capital de
-# Ecuador" el 2026-08-27:
+# La voz de SAPI sale a unos -22.4 dBFS de RMS, que en un parlante de 40 mm
+# se oye bajita. Medido sobre la misma frase:
 #
-#   sin filtro                  RMS -22.4 dBFS   0 recortadas
-#   volume=2.0                  RMS -16.5 dBFS  54 recortadas
-#   speechnorm e=25 + limiter   RMS -16.6 dBFS   0 recortadas  <- elegido
-#   speechnorm e=25 vol1.2 lim  RMS -15.7 dBFS   7 recortadas
+#   sin filtro                        RMS -22.4 dBFS    0 recortadas
+#   volume=2.0 solo                   RMS -16.5 dBFS   54 recortadas
+#   acompressor 4:1                   RMS -19.6 dBFS    0   (PEOR)
+#   acompressor 8:1                   RMS -21.1 dBFS    0   (PEOR)
+#   speechnorm + limiter              RMS -16.6 dBFS    0 recortadas
+#   highpass150 + sn + vol2.0 + lim   RMS -13.8 dBFS   17 recortadas  <- esta
+#   highpass250 + sn + vol6.0 + lim   RMS -12.0 dBFS   49 recortadas
 #
-# speechnorm esta hecho para voz: sube los tramos flojos sin
-# tocar los picos. El limiter es el cinturon de seguridad.
-# Gana ~5.8 dB sin distorsionar nada.
+# Conclusiones, para no repetir el camino:
+#   - acompressor EMPEORA el volumen percibido, en cualquier ratio.
+#   - el limitador ya topa: subir la entrada de 2.0 a 6.0 solo da +2 dB y
+#     duplica el recorte. El RMS se asintota en unos -12 dBFS.
+#   - highpass a 150 Hz mejora RMS y recorte a la vez, y evita que el
+#     parlante gaste excursion en graves que no puede reproducir.
 #
-# Si AUN se oye bajo, lo que queda es hardware: el pin GAIN del
-# MAX98357A esta sin conectar (9 dB). Puenteado a GND da 15 dB,
-# +6 dB mas. Eso es soldadura, no software.
-# Segunda medida (2026-08-27), buscando mas volumen porque seguia
-# oyendose bajo. Los retornos son decrecientes y la compresion
-# empeora las cosas:
-#
-#   speechnorm + limiter          RMS -16.6 dBFS    0 recortadas
-#   + acompressor 4:1             RMS -19.6 dBFS    0   (PEOR)
-#   + acompressor 8:1             RMS -21.1 dBFS    0   (PEOR)
-#   + volume 1.5                  RMS -14.8 dBFS   12 recortadas
-#   + volume 2.0                  RMS -14.0 dBFS   19 recortadas  <- elegido
-#   + volume 3.0                  RMS -13.0 dBFS   29 recortadas
-#
-# volume=2.0 recorta 19 muestras de ~52000 (0.04%): inaudible.
-# Total acumulado: +8.4 dB sobre la voz cruda de SAPI.
-#
-# EL SOFTWARE ESTA AGOTADO. Lo que queda es el pin GAIN del
-# MAX98357A, hoy sin conectar (9 dB). Un cable de GAIN a GND lo
-# pone en 15 dB: +6 dB, mas que todo lo que hace este filtro.
-# Tercera medida (2026-08-27). Se probo quitar graves para liberar
-# margen, porque un parlante de 40 mm no los reproduce igual:
-#
-#   sn + vol2.0                 RMS -14.0 dBFS  19 recortadas
-#   highpass 150 + sn + vol2.0  RMS -13.8 dBFS  17 recortadas  <- elegido
-#   highpass 250 + sn + vol2.0  RMS -14.3 dBFS  20 recortadas
-#   highpass 250 + sn + vol6.0  RMS -12.0 dBFS  49 recortadas
-#   + realce de presencia 3 kHz RMS -12.4 dBFS  38 recortadas
-#
-# El limitador ya esta topando: subir la entrada de 2.0 a 6.0 solo
-# da +2 dB y mete mas recorte. El RMS se asintota en unos -12 dBFS.
-#
-# highpass a 150 Hz mejora RMS y recortes a la vez, y ademas evita
-# que el parlante gaste excursion en graves que no puede dar.
-#
-# AQUI SE ACABA EL SOFTWARE: de -22.4 dBFS crudos a -13.8 son
-# +8.6 dB, y el techo teorico esta en unos -12. Lo que falta es
-# fisico: montar el parlante en la carcasa (un driver al aire se
-# cancela consigo mismo), el pin GAIN, y la corriente disponible.
+# Acumulado: +8.6 dB sobre la voz cruda. Queda menos de 2 dB por exprimir.
+# Si hay que subir volumen otra vez, mirar primero lo ACUSTICO: montar el
+# parlante en la carcasa dio mas que todo este filtro junto.
 LOUDNESS_FILTER = (
     "highpass=f=150"
     ",speechnorm=e=25:r=0.0001:l=1"
@@ -769,15 +746,113 @@ def remove_wake_word(text):
 # EVE
 # ======================================================
 
-def eve_health():
+def load_agent_token():
+    """
+    Token compartido con el canal de eve.
+
+    Prioridad: variable de entorno, y si no, `brain/.env.local`. Leerlo del
+    mismo archivo que usa eve evita tener el secreto en dos sitios que se
+    puedan desincronizar.
+
+    Devuelve None si no hay token. En ese caso el puente sigue funcionando
+    contra `eve dev`, que acepta al principal sintetico de `localDev()`, pero
+    NO contra `eve start`.
+    """
+
+    from_env = os.environ.get("KIRA_AGENT_TOKEN")
+
+    if from_env:
+        return from_env.strip()
+
+    if not os.path.exists(EVE_ENV_FILE):
+        return None
 
     try:
 
-        with urllib.request.urlopen(f"{EVE_URL}/eve/v1/health", timeout=5) as response:
+        with open(EVE_ENV_FILE, encoding="utf-8") as handle:
+
+            for line in handle:
+
+                line = line.strip()
+
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+
+                name, _, value = line.partition("=")
+
+                if name.strip() == "KIRA_AGENT_TOKEN":
+                    return value.strip().strip('"').strip("'")
+
+    except OSError:
+        return None
+
+    return None
+
+
+AGENT_TOKEN = load_agent_token()
+
+
+def eve_headers(extra=None):
+
+    headers = dict(extra or {})
+
+    if AGENT_TOKEN:
+        headers["authorization"] = f"Bearer {AGENT_TOKEN}"
+
+    return headers
+
+
+def eve_health():
+    """
+    La ruta de salud es publica: eve la deja fuera del walk de auth para que
+    los monitores puedan sondearla. Sirve para saber si el proceso esta vivo,
+    NO para saber si el token es correcto.
+    """
+
+    try:
+
+        request = urllib.request.Request(
+            f"{EVE_URL}/eve/v1/health",
+            headers=eve_headers(),
+        )
+
+        with urllib.request.urlopen(request, timeout=5) as response:
             return json.loads(response.read().decode("utf-8")).get("ok") is True
 
     except Exception:
         return False
+
+
+def wait_for_eve(timeout=None):
+    """
+    Espera a que eve responda, en vez de rendirse al primer intento.
+
+    Imprescindible para el arranque automatico: al iniciar sesion las dos
+    tareas arrancan a la vez, y el puente casi siempre gana la carrera porque
+    eve tiene que levantar su runtime. Sin esta espera, el puente moria en
+    cada arranque en frio y Kira quedaba muda hasta que alguien la arrancaba
+    a mano.
+    """
+
+    if timeout is None:
+        timeout = float(os.environ.get("KIRA_EVE_WAIT", "120"))
+
+    deadline = time.time() + timeout
+    announced = False
+
+    while True:
+
+        if eve_health():
+            return True
+
+        if time.time() >= deadline:
+            return False
+
+        if not announced:
+            print(f"Esperando a que eve arranque en {EVE_URL}...")
+            announced = True
+
+        time.sleep(1.0)
 
 
 def eve_send(message, session_id=None, event_offset=0):
@@ -811,7 +886,7 @@ def eve_send(message, session_id=None, event_offset=0):
     request = urllib.request.Request(
         url,
         data=body,
-        headers={"content-type": "application/json"},
+        headers=eve_headers({"content-type": "application/json"}),
         method="POST",
     )
 
@@ -833,7 +908,12 @@ def eve_send(message, session_id=None, event_offset=0):
     failure = None
     seen = 0
 
-    with urllib.request.urlopen(stream_url, timeout=180) as stream:
+    stream_request = urllib.request.Request(
+        stream_url,
+        headers=eve_headers(),
+    )
+
+    with urllib.request.urlopen(stream_request, timeout=180) as stream:
 
         for raw in stream:
 
@@ -1032,7 +1112,7 @@ def main():
     print("=" * 46)
     print()
 
-    if not eve_health():
+    if not wait_for_eve():
         print(f"FALLO: eve no responde en {EVE_URL}")
         print()
         print("Arrancalo en otra terminal:")
@@ -1041,6 +1121,11 @@ def main():
         return 1
 
     print(f"eve listo en {EVE_URL}")
+
+    if not AGENT_TOKEN:
+        print()
+        print("AVISO: sin KIRA_AGENT_TOKEN. Funcionara contra `eve dev`, pero")
+        print("       `eve start` (produccion) devolvera 401.")
 
     print(f"Cargando Whisper ({WHISPER_MODEL})...")
 

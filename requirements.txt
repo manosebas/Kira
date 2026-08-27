@@ -1,0 +1,26 @@
+# Dependencias de Python de kira_bridge.py
+#
+#   pip install -r requirements.txt
+#
+# Requiere ademas, y NO se instalan con pip:
+#   - Python 3.13+
+#   - FFmpeg en el PATH   (conversion de audio)
+#   - Windows con SAPI5   (voz; se usa por comtypes)
+#   - Node.js 24+         (para el agente de brain/)
+#
+# NO agregar aqui:
+#   - pydub    : Python 3.13 elimino audioop
+#   - pyttsx3  : su driver SAPI5 se cuelga en el segundo runAndWait() del
+#                mismo proceso, y el puente habla en bucle
+
+# Puerto serie hacia el ESP32
+pyserial==3.5
+
+# SAPI5 de Windows para la voz. Es una dependencia directa: el puente
+# importa comtypes.client y comtypes.gen.SpeechLib.
+comtypes==1.4.16
+
+# Transcripcion local. Arrastra ctranslate2, onnxruntime, av, tokenizers,
+# huggingface-hub y numpy, que no se fijan aqui a proposito para no pelear
+# con las ruedas precompiladas de cada plataforma.
+faster-whisper==1.2.1
