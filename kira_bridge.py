@@ -118,8 +118,28 @@ VOICE_RATE = 0
 # EL SOFTWARE ESTA AGOTADO. Lo que queda es el pin GAIN del
 # MAX98357A, hoy sin conectar (9 dB). Un cable de GAIN a GND lo
 # pone en 15 dB: +6 dB, mas que todo lo que hace este filtro.
+# Tercera medida (2026-08-27). Se probo quitar graves para liberar
+# margen, porque un parlante de 40 mm no los reproduce igual:
+#
+#   sn + vol2.0                 RMS -14.0 dBFS  19 recortadas
+#   highpass 150 + sn + vol2.0  RMS -13.8 dBFS  17 recortadas  <- elegido
+#   highpass 250 + sn + vol2.0  RMS -14.3 dBFS  20 recortadas
+#   highpass 250 + sn + vol6.0  RMS -12.0 dBFS  49 recortadas
+#   + realce de presencia 3 kHz RMS -12.4 dBFS  38 recortadas
+#
+# El limitador ya esta topando: subir la entrada de 2.0 a 6.0 solo
+# da +2 dB y mete mas recorte. El RMS se asintota en unos -12 dBFS.
+#
+# highpass a 150 Hz mejora RMS y recortes a la vez, y ademas evita
+# que el parlante gaste excursion en graves que no puede dar.
+#
+# AQUI SE ACABA EL SOFTWARE: de -22.4 dBFS crudos a -13.8 son
+# +8.6 dB, y el techo teorico esta en unos -12. Lo que falta es
+# fisico: montar el parlante en la carcasa (un driver al aire se
+# cancela consigo mismo), el pin GAIN, y la corriente disponible.
 LOUDNESS_FILTER = (
-    "speechnorm=e=25:r=0.0001:l=1"
+    "highpass=f=150"
+    ",speechnorm=e=25:r=0.0001:l=1"
     ",volume=2.0"
     ",alimiter=limit=0.97"
 )
