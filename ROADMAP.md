@@ -8,6 +8,25 @@ Los detalles técnicos están en `CLAUDE.md`.
 
 ---
 
+## Cómo arrancar Kira hoy
+
+Doble clic, o desde una terminal en la carpeta del proyecto:
+
+```
+run_brain.cmd     el cerebro (los agentes)
+run_bridge.cmd    el puente (microfono, voz, parlante)
+```
+
+Ninguno abre ventana visible. Los logs quedan en `logs\brain.log` y `logs\bridge.log`.
+
+Para pararla —**obligatorio antes de subir firmware**, porque el puente tiene COM5 tomado:
+
+```
+stop_kira.cmd
+```
+
+---
+
 ## Dónde estamos
 
 **Kira ya escucha, piensa con agentes y responde por su parlante.**
@@ -54,36 +73,58 @@ de verdad** (correo, calendario, casa), y que **arranque sola al encender la com
 
 ---
 
-## Fase 4 — Salir a producción ⬜ SIGUIENTE
+## Fase 4 — Salir a producción 🔨 CASI COMPLETA
 
 **Objetivo: enciendes la computadora y Kira funciona. Sin abrir terminales, sin comandos.**
 
-Hoy hay que arrancar dos cosas a mano cada vez. Eso es lo que hay que quitar.
+- ✅ **Autenticación del canal de eve.**
+  Era el bloqueo: `eve start` devolvía 401 por la autenticación de relleno del scaffold.
+  Ahora usa un token compartido con el puente. Sin esto no había producción posible.
 
-- ⬜ **Poner autenticación al canal de eve.**
-  Hoy solo funciona el modo de desarrollo (`eve dev`). El modo de producción (`eve start`)
-  responde 401 porque el scaffold trae una autenticación de relleno. Sin esto no hay
-  producción. Es un archivo: `brain/agent/channels/eve.ts`.
+- ✅ **`requirements.txt`** con las dependencias de Python fijadas.
 
-- ⬜ **Anotar las dependencias de Python** en un `requirements.txt`.
-  Ahora mismo están instaladas "porque sí". Si algo se rompe o cambias de máquina, no hay
-  forma de reinstalarlas.
+- ✅ **Modo producción funcionando** (`eve build` + `eve start`), verificado con el ciclo
+  completo hasta el parlante.
 
-- ⬜ **Compilar eve para producción** (`eve build`) y comprobar que `eve start` aguanta un
-  uso normal, no solo que arranca.
+- ✅ **Arranque sin ventanas de consola.** Tres scripts:
+  `run_brain.cmd`, `run_bridge.cmd`, `stop_kira.cmd`.
 
-- ⬜ **Crear dos tareas programadas de Windows**, con disparador *"al iniciar sesión"*:
-  una para el cerebro (`eve start`) y otra para el puente (`kira_bridge.py`).
-  Usar `pythonw` en vez de `python` para que no aparezca ninguna ventana negra.
+- ✅ **El puente espera al cerebro** en vez de rendirse. Sin esto, en un arranque en frío
+  las dos partes arrancan a la vez, el puente gana la carrera y se moría.
+
+- ⬜ **Registrar las tareas programadas de Windows** — *aplazado a propósito, ver abajo.*
 
 - ⬜ **Probar el arranque en frío**: reiniciar la computadora, no tocar nada, y decir
-  "Oye Kira".
+  "Oye Kira". (Depende del punto anterior.)
 
 - ⬜ **Manejo de fallos.** Si el cerebro no responde o el ESP32 se desconecta, que Kira lo
   diga por el parlante en vez de quedarse muda.
 
 - ⬜ **Pasar el repositorio a privado** antes de guardar cualquier credencial:
   `gh repo edit manosebas/Kira --visibility private`
+
+### ⏸ APLAZADO — registrar el arranque automático
+
+**Decidido: hacerlo cuando el proyecto esté terminado, no ahora.**
+
+**Por qué se aplaza:** una vez registradas, las tareas toman **COM5 en cada inicio de
+sesión**. Las fases 6 y 7 (pantalla y Wi-Fi) van a pedir muchos uploads de firmware, y cada
+upload fallaría hasta ejecutar `stop_kira.cmd`. No vale la pena esa fricción todavía.
+
+**Mientras tanto:** arrancar Kira a mano con `run_brain.cmd` y `run_bridge.cmd`.
+
+**Cuando el proyecto esté terminado**, ejecutar una sola vez (como Administrador):
+
+```powershell
+$K = "C:\Users\Administrador\Documents\Cosas\PROYECTOS\Kira"
+schtasks /create /tn "Kira Brain"  /tr "'$K\run_brain.cmd'"  /sc onlogon /rl highest /f
+schtasks /create /tn "Kira Bridge" /tr "'$K\run_bridge.cmd'" /sc onlogon /rl highest /f
+```
+
+Comprobar con `schtasks /query /tn "Kira Brain"`, y quitarlas con
+`schtasks /delete /tn "Kira Brain" /f` si estorban.
+
+Después: **reiniciar, no tocar nada, y decir "Oye Kira"**. Ese es el examen final de la fase.
 
 ---
 
