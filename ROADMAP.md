@@ -2,7 +2,8 @@
 
 Estado del proyecto y lo que falta, en pasos sencillos.
 
-Los detalles técnicos están en `CLAUDE.md`.
+- **`USO.md`** — qué hacer en cada caso: desarrollar agentes, cambiar firmware, solo usarla.
+- **`CLAUDE.md`** — los detalles técnicos.
 
 **Leyenda:** ✅ hecho y probado físicamente · 🔨 en curso · ⬜ pendiente
 
@@ -10,20 +11,18 @@ Los detalles técnicos están en `CLAUDE.md`.
 
 ## Cómo arrancar Kira hoy
 
-Doble clic, o desde una terminal en la carpeta del proyecto:
-
 ```
 run_brain.cmd     el cerebro (los agentes)
 run_bridge.cmd    el puente (microfono, voz, parlante)
+stop_kira.cmd     parar las dos
 ```
 
 Ninguno abre ventana visible. Los logs quedan en `logs\brain.log` y `logs\bridge.log`.
 
-Para pararla —**obligatorio antes de subir firmware**, porque el puente tiene COM5 tomado:
+`stop_kira.cmd` es **obligatorio antes de subir firmware**: el puente tiene COM5 tomado en
+exclusiva y el upload falla mientras esté vivo.
 
-```
-stop_kira.cmd
-```
+**Para desarrollar, ver `USO.md`**, que tiene el caso a caso.
 
 ---
 
