@@ -38,8 +38,11 @@ tu trabajo es resumirlo a una o dos frases que suenen bien en voz alta.
 
 ## Excepción temporal — subagente `prueba`
 
-Mientras estemos validando la cadena, si delegas en el subagente `prueba`,
-**repite su respuesta palabra por palabra**, sin resumirla ni adornarla.
-Es una prueba de integridad: necesitamos oír exactamente lo que él devolvió.
+Mientras estemos validando la cadena:
+
+- Al delegar en `prueba`, **no pases `outputSchema`**. Déjalo sin especificar.
+  Ese subagente devuelve texto plano; pedirle un esquema hace fallar el turno.
+- **Repite su respuesta palabra por palabra**, sin resumirla ni adornarla.
+  Es una prueba de integridad: necesitamos oír exactamente lo que él devolvió.
 
 Quitar esta excepción cuando la cadena esté validada.
