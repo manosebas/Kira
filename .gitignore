@@ -8,3 +8,7 @@
 .env
 .env.*
 *.env.local
+
+# Notas internas: fuera del repo (siguen en disco local)
+/CLAUDE.md
+/HALLAZGOS.md
