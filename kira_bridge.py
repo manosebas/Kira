@@ -83,7 +83,28 @@ VOICE_MATCH = "ES-"
 # quedo validada: su formula da int(log(165/156.63, 1.11)) == 0.
 VOICE_RATE = 0
 
-# Ganancia de software aplicada por FFmpeg. 1.0 = sin tocar.
+# Cadena de FFmpeg para subir el volumen de la voz.
+#
+# La voz de SAPI sale a unos -22 dBFS de RMS, que en un parlante
+# de 40 mm se oye bajita. Medido con "Quito es la capital de
+# Ecuador" el 2026-08-27:
+#
+#   sin filtro                  RMS -22.4 dBFS   0 recortadas
+#   volume=2.0                  RMS -16.5 dBFS  54 recortadas
+#   speechnorm e=25 + limiter   RMS -16.6 dBFS   0 recortadas  <- elegido
+#   speechnorm e=25 vol1.2 lim  RMS -15.7 dBFS   7 recortadas
+#
+# speechnorm esta hecho para voz: sube los tramos flojos sin
+# tocar los picos. El limiter es el cinturon de seguridad.
+# Gana ~5.8 dB sin distorsionar nada.
+#
+# Si AUN se oye bajo, lo que queda es hardware: el pin GAIN del
+# MAX98357A esta sin conectar (9 dB). Puenteado a GND da 15 dB,
+# +6 dB mas. Eso es soldadura, no software.
+LOUDNESS_FILTER = "speechnorm=e=25:r=0.0001:l=1,alimiter=limit=0.97"
+
+# Ganancia extra encima de la cadena anterior. 1.0 = sin tocar.
+# Subir de aqui empieza a recortar muestras.
 VOLUME = 1.0
 
 # Audio mas corto que esto no se transcribe: es un ruido, no una frase.
@@ -459,6 +480,55 @@ def send_pcm(ser, pcm):
 # STT
 # ======================================================
 
+def trim_trailing_silence(audio, keep_ms=300):
+    """
+    Quita el silencio del final, dejando un margen corto.
+
+    El firmware cierra la frase tras SILENCE_STOP_MS de silencio,
+    y ese silencio queda dentro de la grabacion. Con 3 s de pausa
+    son 3 s que Whisper procesaria para nada, sumando latencia.
+
+    El umbral se saca del propio audio (una fraccion del pico), asi
+    que no hay que recalibrarlo si cambia MIC_SHIFT o el volumen
+    de la voz.
+    """
+
+    block = SAMPLE_RATE * 32 // 1000          # 32 ms, como el firmware
+    total = len(audio) // 2
+
+    if total <= block:
+        return audio
+
+    samples = struct.unpack(f"<{total}h", audio)
+
+    peak = max(max(samples), -min(samples))
+
+    if peak == 0:
+        return audio
+
+    threshold = max(peak // 12, 200)
+
+    keep_blocks = max(1, (keep_ms * SAMPLE_RATE // 1000) // block)
+
+    last_loud = -1
+
+    for index in range(total // block):
+
+        chunk = samples[index * block:(index + 1) * block]
+
+        level = sum(abs(value) for value in chunk) // block
+
+        if level > threshold:
+            last_loud = index
+
+    if last_loud < 0:
+        return audio
+
+    end_block = min(total // block, last_loud + 1 + keep_blocks)
+
+    return audio[:end_block * block * 2]
+
+
 def transcribe(model, audio):
 
     if len(audio) < MIN_AUDIO_BYTES:
@@ -585,13 +655,25 @@ def eve_health():
         return False
 
 
-def eve_send(message, session_id=None):
+def eve_send(message, session_id=None, event_offset=0):
     """
-    Manda el texto al orquestador y devuelve (respuesta, session_id).
+    Manda el texto al orquestador y devuelve
+    (respuesta, session_id, nuevo_offset).
 
     Dos llamadas: una crea o continua la sesion, la otra lee el
     stream de eventos hasta que el turno termina. El stream es
     NDJSON, un evento JSON por linea.
+
+    OJO con `event_offset`: el stream de una sesion se reproduce
+    DESDE EL EVENTO 0, no desde el ultimo. Sin este offset, la
+    segunda pregunta leia los eventos del primer turno, cortaba en
+    su `session.waiting` y devolvia la respuesta ANTERIOR. En la
+    prueba real eso hacia que Kira contestara "Quito" a "cuanto es
+    25 por 48" (2026-08-27).
+
+    Doble cinturon: se pide el stream con ?startIndex y ademas se
+    toma el ULTIMO message.completed, no el primero, para que un
+    desfase de un evento no cambie el resultado.
     """
 
     if session_id:
@@ -618,13 +700,19 @@ def eve_send(message, session_id=None):
 
     stream_url = f"{EVE_URL}/eve/v1/session/{session_id}/stream"
 
+    if event_offset > 0:
+        stream_url += f"?startIndex={event_offset}"
+
     answer = None
     delegated = []
     failure = None
+    seen = 0
 
     with urllib.request.urlopen(stream_url, timeout=180) as stream:
 
         for raw in stream:
+
+            seen += 1
 
             line = raw.decode("utf-8", errors="replace").strip()
 
@@ -660,7 +748,7 @@ def eve_send(message, session_id=None):
     if failure and not answer:
         raise RuntimeError(f"eve fallo: {failure}")
 
-    return answer, session_id
+    return answer, session_id, event_offset + seen
 
 
 # ======================================================
@@ -713,8 +801,16 @@ def convert_audio(input_path):
         "-acodec", "pcm_s16le",      # PCM signed 16-bit little endian
     ]
 
+    filters = []
+
+    if LOUDNESS_FILTER:
+        filters.append(LOUDNESS_FILTER)
+
     if VOLUME != 1.0:
-        command += ["-af", f"volume={VOLUME}"]
+        filters.append(f"volume={VOLUME}")
+
+    if filters:
+        command += ["-af", ",".join(filters)]
 
     command += [output_path]
 
@@ -836,6 +932,11 @@ def main():
     ser = None
     session_id = None
 
+    # Cuantos eventos del stream de eve ya consumimos. El stream se
+    # reproduce desde el evento 0 en cada lectura, asi que sin esto
+    # la segunda pregunta devolveria la respuesta de la primera.
+    event_offset = 0
+
     try:
 
         ser = open_port(find_port())
@@ -911,20 +1012,36 @@ def main():
 
             recording = False
 
+            raw_seconds = len(audio) / 2 / SAMPLE_RATE
+
+            # La pausa que cierra la frase queda grabada al final.
+            # Con SILENCE_STOP_MS en 3 s eso son 3 s de silencio
+            # que Whisper transcribiria para nada.
+            audio = trim_trailing_silence(bytes(audio))
+
             seconds = len(audio) / 2 / SAMPLE_RATE
 
             peak = struct.unpack("<H", payload)[0] if len(payload) >= 2 else 0
 
-            print(f"Fin de voz: {seconds:.2f} s | pico {peak}/32767")
+            trimmed = raw_seconds - seconds
+
+            print(
+                f"Fin de voz: {seconds:.2f} s "
+                f"(recortados {trimmed:.2f} s de pausa) | pico {peak}/32767"
+            )
 
             # El pico permite ajustar MIC_SHIFT del firmware con
             # una medida real en vez de a ojo.
+            #
+            # El aviso de senal debil solo tiene sentido en algo
+            # que de verdad sea una frase: un golpe corto da un
+            # pico bajo sin que la ganancia este mal.
             if peak >= 32767:
                 print("  AVISO: recorte. Sube MIC_SHIFT en 1 en el firmware.")
-            elif 0 < peak < 3000:
+            elif 0 < peak < 3000 and seconds >= 1.0:
                 print("  AVISO: senal debil. Baja MIC_SHIFT en 1 en el firmware.")
 
-            text = transcribe(model, bytes(audio))
+            text = transcribe(model, audio)
 
             if not text:
                 print("No entendi el audio.")
@@ -953,10 +1070,12 @@ def main():
 
             try:
 
-                answer, session_id = eve_send(
-                    message,
-                    session_id if REUSE_SESSION else None,
-                )
+                if REUSE_SESSION:
+                    answer, session_id, event_offset = eve_send(
+                        message, session_id, event_offset
+                    )
+                else:
+                    answer, _, _ = eve_send(message, None, 0)
 
             except Exception as error:
 

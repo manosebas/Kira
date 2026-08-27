@@ -89,9 +89,26 @@
 #define VOICE_FLOOR_MIN    250
 #define SILENCE_FLOOR_MIN   80
 
-// Estos contadores si eran correctos y se conservan.
-#define VOICE_BLOCKS_TO_START  3
-#define SILENCE_BLOCKS_TO_STOP 6
+// Bloques de voz seguidos para declarar que empezo a hablar.
+// 3 * 32 ms = ~96 ms. Suficiente para no arrancar con un golpe
+// aislado, y corto para no perder el inicio de la palabra.
+#define VOICE_BLOCKS_TO_START 3
+
+// Pausa de silencio que cierra la frase.
+//
+// ESTE ES EL NUMERO QUE AJUSTA "CUANTO ESPERA KIRA A QUE
+// TERMINES DE HABLAR". Es tambien latencia: Kira no empieza a
+// pensar hasta que pasa esta pausa, asi que se suma a lo que
+// tardas en oir la respuesta.
+//
+// Era 192 ms (6 bloques) y cortaba al instante en cuanto el
+// usuario respiraba. 3 s es lo que se pidio tras la prueba del
+// 2026-08-27. Si se hace pesado, 1000-1500 ms suele ser el
+// punto dulce para dictado normal.
+#define SILENCE_STOP_MS 3000
+
+#define SILENCE_BLOCKS_TO_STOP \
+  ((SILENCE_STOP_MS) / ((MIC_BLOCK_SAMPLES) * 1000 / (SAMPLE_RATE)))
 
 // Peso del ruido de fondo nuevo en la media movil, en 1/16.
 // 1/16 = se adapta en ~1 s, lo bastante lento para que la
