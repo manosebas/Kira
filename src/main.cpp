@@ -119,14 +119,21 @@
 // entrega 24 bits utiles alineados a la izquierda dentro
 // de 32.
 //
-// 11 producia recorte (pico 32768/32767 medido en hardware
-// 2026-08-27). 13 da 4x de margen.
+// Historial medido en hardware el 2026-08-27:
+//   11 -> recorte (pico 32768/32767)
+//   13 -> picos tipicos 12822-21080, pero una frase hablada
+//         de cerca volvio a recortar (32768)
+//   14 -> elegido. Picos esperados ~6000-10500, de sobra para
+//         Whisper y con margen para hablar fuerte o de cerca.
+//
+// El recorte importa mas que el nivel: distorsiona la forma de
+// onda y empeora la transcripcion. Es mejor quedarse corto.
 //
 // COMO AJUSTARLO: el frame VOICE_END lleva el pico de la
 // frase (0..32767). Si el pico se queda por debajo de
 // ~3000, baja el shift en 1. Si toca 32767 (recorte),
 // sube el shift en 1.
-#define MIC_SHIFT 13
+#define MIC_SHIFT 14
 
 // Cada cuantos bloques se manda telemetria de nivel.
 // 16 bloques * 32 ms = ~0.5 s.

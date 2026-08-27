@@ -101,10 +101,30 @@ VOICE_RATE = 0
 # Si AUN se oye bajo, lo que queda es hardware: el pin GAIN del
 # MAX98357A esta sin conectar (9 dB). Puenteado a GND da 15 dB,
 # +6 dB mas. Eso es soldadura, no software.
-LOUDNESS_FILTER = "speechnorm=e=25:r=0.0001:l=1,alimiter=limit=0.97"
+# Segunda medida (2026-08-27), buscando mas volumen porque seguia
+# oyendose bajo. Los retornos son decrecientes y la compresion
+# empeora las cosas:
+#
+#   speechnorm + limiter          RMS -16.6 dBFS    0 recortadas
+#   + acompressor 4:1             RMS -19.6 dBFS    0   (PEOR)
+#   + acompressor 8:1             RMS -21.1 dBFS    0   (PEOR)
+#   + volume 1.5                  RMS -14.8 dBFS   12 recortadas
+#   + volume 2.0                  RMS -14.0 dBFS   19 recortadas  <- elegido
+#   + volume 3.0                  RMS -13.0 dBFS   29 recortadas
+#
+# volume=2.0 recorta 19 muestras de ~52000 (0.04%): inaudible.
+# Total acumulado: +8.4 dB sobre la voz cruda de SAPI.
+#
+# EL SOFTWARE ESTA AGOTADO. Lo que queda es el pin GAIN del
+# MAX98357A, hoy sin conectar (9 dB). Un cable de GAIN a GND lo
+# pone en 15 dB: +6 dB, mas que todo lo que hace este filtro.
+LOUDNESS_FILTER = (
+    "speechnorm=e=25:r=0.0001:l=1"
+    ",volume=2.0"
+    ",alimiter=limit=0.97"
+)
 
 # Ganancia extra encima de la cadena anterior. 1.0 = sin tocar.
-# Subir de aqui empieza a recortar muestras.
 VOLUME = 1.0
 
 # Audio mas corto que esto no se transcribe: es un ruido, no una frase.
@@ -303,6 +323,36 @@ def read_token(ser, timeout):
 
         token = data[0]
 
+        # Frame de audio del microfono todavia en vuelo: consumirlo
+        # ENTERO y descartarlo.
+        #
+        # Sin esto sus bytes se interpretan uno a uno como tokens, y
+        # el PCM crudo contiene los cinco valores de token: medido
+        # sobre audio real, 0x06 (ACK) aparece 1 cada 107 bytes y
+        # 0x23 (ERR) 1 cada 575. De ahi salia el falso "El ESP32
+        # rechazo el comando 0x02 (ERR)" (2026-08-27).
+        if token == UP_MAGIC0:
+
+            second = ser.read(1)
+
+            if second and second[0] == UP_MAGIC1:
+
+                header = read_exactly(ser, 3, timeout=0.5)
+
+                if header is not None:
+
+                    length = struct.unpack("<H", header[1:3])[0]
+
+                    if 0 < length <= 4096:
+                        read_exactly(ser, length, timeout=1.0)
+
+                continue
+
+            if second and second[0] in TOKEN_NAMES:
+                return second[0]
+
+            continue
+
         if token in TOKEN_NAMES:
             return token
 
@@ -422,6 +472,21 @@ def send_frame_acked(ser, cmd, seq, payload=b"", timeout=3.0, retries=3):
                 break
 
             if token == TOK_ERR:
+
+                # El firmware manda el motivo como texto JUSTO
+                # DESPUES del token (p.ej. "KIRA ERR_SPEAK i2s=-1").
+                # Sin este drenado se lanzaba la excepcion antes de
+                # leerlo y el diagnostico se perdia, que es lo que
+                # paso en la prueba del 2026-08-27.
+                deadline_text = time.time() + 0.4
+
+                while time.time() < deadline_text:
+
+                    extra = ser.read(1)
+
+                    if extra:
+                        collect_esp_text(extra[0])
+
                 raise RuntimeError(
                     f"El ESP32 rechazo el comando 0x{cmd:02X} (ERR)."
                 )
@@ -436,8 +501,48 @@ def send_pcm(ser, pcm):
 
     total = len(pcm)
 
-    if not send_frame_acked(ser, CMD_BEGIN, 0, struct.pack("<I", total)):
-        raise RuntimeError("El ESP32 no confirmo el inicio (BEGIN).")
+    # CRITICO: tirar el backlog de entrada antes de hablar.
+    #
+    # Mientras la PC transcribe, consulta a eve y genera el TTS
+    # pasan segundos, y el ESP32 sigue enviando audio del microfono
+    # a 32 kB/s si detecta voz. Ese backlog es PCM crudo, y
+    # read_token() devuelve el primer byte que coincida con un
+    # token conocido: entre miles de bytes aleatorios aparece 0x23,
+    # que es TOK_ERR. Resultado: "El ESP32 rechazo el comando 0x02
+    # (ERR)" sin que el ESP32 hubiera rechazado nada.
+    #
+    # Encajaba con los sintomas: intermitente, siempre tras las
+    # respuestas mas largas (mas tiempo pensando = mas backlog), y
+    # sin el texto de diagnostico que el firmware si emite cuando
+    # el error es real (2026-08-27).
+    #
+    # Descartarlo es lo correcto ademas por comportamiento: lo que
+    # se dijo mientras Kira pensaba no es una peticion nueva.
+    ser.reset_input_buffer()
+
+    # BEGIN reintentado, como red de seguridad para un fallo real
+    # del cambio de modo: si i2sInstallSpeak falla, el firmware
+    # contesta ERR y se recupera solo volviendo a ESCUCHA.
+    begin_payload = struct.pack("<I", total)
+
+    for attempt in (1, 2, 3):
+
+        try:
+
+            if send_frame_acked(ser, CMD_BEGIN, 0, begin_payload):
+                break
+
+            raise RuntimeError("El ESP32 no confirmo el inicio (BEGIN).")
+
+        except RuntimeError as error:
+
+            if attempt == 3:
+                raise
+
+            print(f"  BEGIN falló (intento {attempt}): {error} — reintentando")
+
+            ser.reset_input_buffer()
+            time.sleep(0.35)
 
     print("Reproduciendo...")
 
