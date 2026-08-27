@@ -65,27 +65,55 @@
 // leidos, que producen 512 int16 = 1024 B = 32 ms.
 #define MIC_BLOCK_SAMPLES 512
 
-// Umbrales de deteccion de voz. CALIBRADOS EN ESTE ENTORNO
-// (este cuarto, esta distancia al microfono). El nivel se
-// mide con (abs(raw) >> 14), la misma escala con la que se
-// calibraron estos numeros. No cambiar sin recalibrar.
-#define LEVEL_SHIFT           14
-#define VOICE_THRESHOLD      250
-#define SILENCE_THRESHOLD     80
+// Escala del nivel: el nivel de un bloque es la media de
+// abs(raw >> LEVEL_SHIFT).
+#define LEVEL_SHIFT 14
+
+// Umbrales ADAPTATIVOS, calculados sobre el ruido de fondo
+// medido en vivo.
+//
+// Por que adaptativos y no los 250/80 fijos de CLAUDE.md:
+// esos numeros venian de otra metrica de nivel. Medidos con
+// la media de absolutos, la voz de este microfono da del
+// orden de 4000, asi que un umbral de silencio de 80 es
+// inalcanzable: la frase no terminaba nunca y siempre
+// cortaba por el tope de 12.8 s. Medido en hardware
+// 2026-08-27.
+#define VOICE_FACTOR_NUM    30   // inicio de voz = ruido * 3.0
+#define VOICE_FACTOR_DEN    10
+#define SILENCE_FACTOR_NUM  18   // fin de voz    = ruido * 1.8
+#define SILENCE_FACTOR_DEN  10
+
+// Suelos absolutos: en una habitacion muy silenciosa evitan
+// que el umbral baje tanto que cualquier crujido dispare.
+#define VOICE_FLOOR_MIN    250
+#define SILENCE_FLOOR_MIN   80
+
+// Estos contadores si eran correctos y se conservan.
 #define VOICE_BLOCKS_TO_START  3
 #define SILENCE_BLOCKS_TO_STOP 6
 
+// Peso del ruido de fondo nuevo en la media movil, en 1/16.
+// 1/16 = se adapta en ~1 s, lo bastante lento para que la
+// propia voz no lo arrastre hacia arriba.
+#define NOISE_EMA_SHIFT 4
+
 // Ganancia del audio que se envia a la PC. El INMP441
 // entrega 24 bits utiles alineados a la izquierda dentro
-// de 32, y a este volumen la voz queda muy por debajo del
-// fondo de escala. Este desplazamiento la sube a un nivel
-// util para Whisper.
+// de 32.
+//
+// 11 producia recorte (pico 32768/32767 medido en hardware
+// 2026-08-27). 13 da 4x de margen.
 //
 // COMO AJUSTARLO: el frame VOICE_END lleva el pico de la
 // frase (0..32767). Si el pico se queda por debajo de
 // ~3000, baja el shift en 1. Si toca 32767 (recorte),
 // sube el shift en 1.
-#define MIC_SHIFT 11
+#define MIC_SHIFT 13
+
+// Cada cuantos bloques se manda telemetria de nivel.
+// 16 bloques * 32 ms = ~0.5 s.
+#define LEVEL_REPORT_BLOCKS 16
 
 // Pre-roll: bloques guardados ANTES de declarar inicio de
 // voz. Sin esto se recorta el arranque de "Oye" y la wake
@@ -136,6 +164,7 @@
 #define UP_START 1
 #define UP_AUDIO 2
 #define UP_END   3
+#define UP_LEVEL 4   // telemetria: nivel actual + ruido de fondo
 
 
 // ======================================================
@@ -149,6 +178,10 @@ enum AudioMode {
 };
 
 static AudioMode audioMode = MODE_NONE;
+
+// Ultimo codigo de error del driver I2S, para poder decir
+// POR QUE fallo un cambio de modo en vez de solo "ERR".
+static esp_err_t lastI2sError = ESP_OK;
 
 // Buffers globales: no en la pila, para no arriesgar
 // desbordarla dentro del loop.
@@ -167,6 +200,10 @@ static uint16_t voiceBlocks    = 0;
 static uint16_t silenceBlocks  = 0;
 static uint16_t phraseBlocks   = 0;
 static uint16_t phrasePeak     = 0;
+
+// Ruido de fondo medido en vivo. -1 = todavia sin medir.
+static int32_t  noiseFloor     = -1;
+static uint16_t levelCountdown = 0;
 
 static bool     sessionActive  = false;
 static bool     i2sRunning     = false;
@@ -276,6 +313,12 @@ static void i2sUninstall() {
   i2s_stop(I2S_PORT);
   i2s_driver_uninstall(I2S_PORT);
 
+  // El driver libera sus buffers DMA y su interrupcion de forma
+  // asincrona. Reinstalar en el mismo tick puede devolver
+  // ESP_ERR_INVALID_STATE o ESP_ERR_NO_MEM. Este margen es
+  // imperceptible al oido y hace el cambio de modo fiable.
+  delay(20);
+
   audioMode  = MODE_NONE;
   i2sRunning = false;
 }
@@ -326,11 +369,15 @@ static bool i2sInstallSpeak() {
     .data_in_num  = I2S_PIN_NO_CHANGE
   };
 
-  if (i2s_driver_install(I2S_PORT, &config, 0, NULL) != ESP_OK) {
+  lastI2sError = i2s_driver_install(I2S_PORT, &config, 0, NULL);
+
+  if (lastI2sError != ESP_OK) {
     return false;
   }
 
-  if (i2s_set_pin(I2S_PORT, &pins) != ESP_OK) {
+  lastI2sError = i2s_set_pin(I2S_PORT, &pins);
+
+  if (lastI2sError != ESP_OK) {
     i2s_driver_uninstall(I2S_PORT);
     return false;
   }
@@ -397,11 +444,29 @@ static bool i2sInstallListen() {
     .data_in_num  = I2S_SD
   };
 
-  if (i2s_driver_install(I2S_PORT, &config, 0, NULL) != ESP_OK) {
+  // CRITICO: dejar DIN del amplificador en LOW fijo.
+  //
+  // En modo escucha el I2S no conduce GPIO 27, pero BCLK y LRC
+  // siguen activos porque los comparte con el microfono. Con DIN
+  // flotando, el MAX98357A lee basura y la reproduce: eso eran
+  // los "sonidos raros aleatorios" del parlante (medido en
+  // hardware 2026-08-27). Forzado a 0 el amplificador recibe
+  // silencio digital.
+  //
+  // i2s_set_pin con data_out_num = I2S_PIN_NO_CHANGE no toca
+  // este pin, asi que la configuracion manual se mantiene.
+  pinMode(I2S_DOUT, OUTPUT);
+  digitalWrite(I2S_DOUT, LOW);
+
+  lastI2sError = i2s_driver_install(I2S_PORT, &config, 0, NULL);
+
+  if (lastI2sError != ESP_OK) {
     return false;
   }
 
-  if (i2s_set_pin(I2S_PORT, &pins) != ESP_OK) {
+  lastI2sError = i2s_set_pin(I2S_PORT, &pins);
+
+  if (lastI2sError != ESP_OK) {
     i2s_driver_uninstall(I2S_PORT);
     return false;
   }
@@ -631,6 +696,57 @@ static void finishPhrase() {
 }
 
 
+static int32_t voiceThreshold() {
+
+  if (noiseFloor < 0) {
+    return VOICE_FLOOR_MIN;
+  }
+
+  int32_t threshold =
+    (noiseFloor * VOICE_FACTOR_NUM) / VOICE_FACTOR_DEN;
+
+  return threshold < VOICE_FLOOR_MIN ? VOICE_FLOOR_MIN : threshold;
+}
+
+
+static int32_t silenceThreshold() {
+
+  if (noiseFloor < 0) {
+    return SILENCE_FLOOR_MIN;
+  }
+
+  int32_t threshold =
+    (noiseFloor * SILENCE_FACTOR_NUM) / SILENCE_FACTOR_DEN;
+
+  return threshold < SILENCE_FLOOR_MIN ? SILENCE_FLOOR_MIN : threshold;
+}
+
+
+static void reportLevel(int32_t level) {
+
+  if (levelCountdown > 0) {
+    levelCountdown--;
+    return;
+  }
+
+  levelCountdown = LEVEL_REPORT_BLOCKS;
+
+  uint16_t levelOut = level > 65535 ? 65535 : (uint16_t)level;
+  uint16_t noiseOut = noiseFloor < 0
+    ? 0
+    : (noiseFloor > 65535 ? 65535 : (uint16_t)noiseFloor);
+
+  uint8_t body[4];
+
+  body[0] = (uint8_t)(levelOut & 0xFF);
+  body[1] = (uint8_t)((levelOut >> 8) & 0xFF);
+  body[2] = (uint8_t)(noiseOut & 0xFF);
+  body[3] = (uint8_t)((noiseOut >> 8) & 0xFF);
+
+  sendUpFrame(UP_LEVEL, body, 4);
+}
+
+
 static void serviceMicrophone() {
 
   int32_t level = captureBlock();
@@ -639,11 +755,23 @@ static void serviceMicrophone() {
     return;
   }
 
+  reportLevel(level);
+
   if (!recording) {
+
+    // El ruido de fondo se mide SOLO cuando no hay voz, y con
+    // una media movil lenta, para que la propia voz no lo
+    // arrastre hacia arriba y suba los umbrales con ella.
+    if (noiseFloor < 0) {
+      noiseFloor = level;
+    } else if (level < voiceThreshold()) {
+      noiseFloor +=
+        (level - noiseFloor) >> NOISE_EMA_SHIFT;
+    }
 
     pushPreRoll();
 
-    if (level > VOICE_THRESHOLD) {
+    if (level > voiceThreshold()) {
 
       voiceBlocks++;
 
@@ -680,7 +808,7 @@ static void serviceMicrophone() {
 
   // Histeresis: ya hablando, el umbral para dar por
   // terminada la frase es MAS BAJO que el de inicio.
-  if (level < SILENCE_THRESHOLD) {
+  if (level < silenceThreshold()) {
 
     silenceBlocks++;
 
@@ -725,7 +853,17 @@ static void handleBegin(uint8_t seq, const uint8_t *payload, uint16_t length) {
   resetVad();
 
   if (!i2sInstallSpeak()) {
+
     sendToken(TOK_ERR);
+
+    // El puente descarta el texto que no encaja con sus
+    // parsers, asi que decir POR QUE fallo no rompe nada y
+    // ahorra adivinar.
+    Serial.printf("KIRA ERR_SPEAK i2s=%d\n", (int)lastI2sError);
+
+    // Volver a un estado conocido en vez de quedarse sin driver.
+    i2sInstallListen();
+
     return;
   }
 

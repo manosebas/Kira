@@ -9,7 +9,7 @@ Ciclo:
 
     INMP441 -> ESP32 -> frames "AA 55" -> faster-whisper (local)
       -> wake word "Oye Kira" -> POST a eve -> orquestador
-      -> subagente -> texto -> pyttsx3 + FFmpeg -> PCM 16 kHz
+      -> subagente -> texto -> SAPI5 + FFmpeg -> PCM 16 kHz
       -> protocolo v2 -> ESP32 -> MAX98357A -> parlante
 
 Protocolos (ver seccion 6 de CLAUDE.md):
@@ -18,10 +18,12 @@ Protocolos (ver seccion 6 de CLAUDE.md):
     PC -> ESP32:  0xA5 0x5A CMD SEQ LEN_LO LEN_HI payload CK   (audio a reproducir)
     ESP32 -> PC:  tokens de 1 byte (2 para ACK: 0x06 + SEQ)
 
-Requiere: pyserial, pyttsx3, faster-whisper, FFmpeg en el PATH,
+Requiere: pyserial, comtypes, faster-whisper, FFmpeg en el PATH,
 y el servidor de eve corriendo (por defecto en 127.0.0.1:2000).
 
 No usa pydub (Python 3.13 ya no trae audioop).
+No usa pyttsx3: su driver SAPI5 se cuelga en el segundo
+runAndWait() del mismo proceso, y este script habla en bucle.
 """
 
 import json
@@ -36,9 +38,11 @@ import urllib.error
 import urllib.request
 import wave
 
-import pyttsx3
 import serial
 import serial.tools.list_ports
+
+from comtypes.client import CreateObject
+from comtypes.gen import SpeechLib
 
 from faster_whisper import WhisperModel
 
@@ -73,13 +77,22 @@ WHISPER_MODEL = "small"
 # Voz de Windows. "ES-" = Helena (espanol de Espana). Sin esto
 # Windows usa Zira (ingles) y todo sale con acento ingles.
 VOICE_MATCH = "ES-"
-VOICE_RATE = 165
+
+# Velocidad en la escala de SAPI (-10 a 10). 0 es exactamente
+# la velocidad que pyttsx3 producia con rate=165, que es la que
+# quedo validada: su formula da int(log(165/156.63, 1.11)) == 0.
+VOICE_RATE = 0
 
 # Ganancia de software aplicada por FFmpeg. 1.0 = sin tocar.
 VOLUME = 1.0
 
 # Audio mas corto que esto no se transcribe: es un ruido, no una frase.
 MIN_AUDIO_BYTES = 2000
+
+# Mostrar la telemetria de nivel del microfono. Util para
+# calibrar MIC_SHIFT y ver los umbrales adaptativos en vivo.
+# Poner en False cuando ya no haga falta el ruido en pantalla.
+SHOW_LEVELS = os.environ.get("KIRA_SHOW_LEVELS", "1") != "0"
 
 
 # ======================================================
@@ -119,6 +132,40 @@ UP_MAGIC1 = 0x55
 UP_START = 1
 UP_AUDIO = 2
 UP_END = 3
+UP_LEVEL = 4
+
+
+# Texto suelto que emite el ESP32 (banner de arranque,
+# diagnosticos como "KIRA ERR_SPEAK i2s=-1"). Los parsers lo
+# descartan por diseno, asi que se acumula aparte para poder
+# mostrarlo en vez de perderlo.
+_esp_text = bytearray()
+
+
+def collect_esp_text(byte_value):
+
+    global _esp_text
+
+    if byte_value == 0x0A:  # newline
+
+        line = _esp_text.decode("ascii", errors="replace").strip()
+        _esp_text = bytearray()
+
+        if line:
+            print(f"  [ESP32] {line}")
+
+        return
+
+    if 0x20 <= byte_value <= 0x7E:
+
+        _esp_text.append(byte_value)
+
+        # Nunca crecer sin limite con basura binaria.
+        if len(_esp_text) > 200:
+            _esp_text = bytearray()
+
+    else:
+        _esp_text = bytearray()
 
 
 def build_frame(cmd, seq, payload=b""):
@@ -238,6 +285,10 @@ def read_token(ser, timeout):
         if token in TOKEN_NAMES:
             return token
 
+        # Aqui es donde aparecen los diagnosticos del firmware,
+        # p.ej. "KIRA ERR_SPEAK i2s=-1" tras un ERR.
+        collect_esp_text(token)
+
     return None
 
 
@@ -277,12 +328,20 @@ def read_up_frame(ser):
 
     first = ser.read(1)
 
-    if not first or first[0] != UP_MAGIC0:
+    if not first:
+        return None
+
+    if first[0] != UP_MAGIC0:
+        collect_esp_text(first[0])
         return None
 
     second = ser.read(1)
 
-    if not second or second[0] != UP_MAGIC1:
+    if not second:
+        return None
+
+    if second[0] != UP_MAGIC1:
+        collect_esp_text(second[0])
         return None
 
     header = read_exactly(ser, 3, timeout=1.0)
@@ -480,16 +539,35 @@ def contains_wake_word(text):
 
 
 WAKE_STRIP = re.compile(
-    r"^\s*(oye|oie|hola|ola)[\s,]+kira[\s,.:;!?-]*",
+    r"(oye|oie|hola|ola)[\s,]+kira[\s,.:;!?-]*",
     re.IGNORECASE,
 )
 
 
 def remove_wake_word(text):
+    """
+    Devuelve lo que viene DESPUES de la wake word.
 
-    # Sobre el texto original, para conservar
-    # mayusculas y acentos de la instruccion.
-    return WAKE_STRIP.sub("", text).strip()
+    Sin anclar al inicio a proposito: en la primera prueba real
+    el usuario dijo "Hola hola, oye Kira, conectate..." y una
+    version anclada con ^ no recortaba nada, asi que el
+    orquestador recibia la wake word dentro de la instruccion.
+
+    Se usa la ULTIMA aparicion: si alguien titubea ("oye Kira...
+    oye Kira, apaga la luz"), lo util es lo que sigue al ultimo
+    intento. Sobre el texto original, para conservar mayusculas
+    y acentos.
+    """
+
+    last = None
+
+    for match in WAKE_STRIP.finditer(text):
+        last = match
+
+    if last is None:
+        return text.strip()
+
+    return text[last.end():].strip()
 
 
 # ======================================================
@@ -589,17 +667,33 @@ def eve_send(message, session_id=None):
 # TTS
 # ======================================================
 
-def create_tts_wav(engine, text):
+def create_tts_wav(voice, text):
+    """
+    Genera el WAV hablando a SAPI5 directamente.
+
+    NO se usa pyttsx3 a proposito: su driver de SAPI5 se cuelga
+    en el SEGUNDO runAndWait() del mismo proceso (comprobado en
+    2026-08-27, el proceso quedaba colgado indefinidamente). Eso
+    daba igual en speak.py, que hablaba una vez y terminaba, pero
+    aqui el puente habla en bucle. SAPI directo aguanta llamadas
+    seguidas sin problema.
+    """
 
     handle = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     path = handle.name
     handle.close()
 
-    engine.save_to_file(text, path)
-    engine.runAndWait()
+    stream = CreateObject("SAPI.SpFileStream")
+    stream.Open(path, SpeechLib.SSFMCreateForWrite)
+
+    try:
+        voice.AudioOutputStream = stream
+        voice.Speak(text)
+    finally:
+        stream.Close()
 
     if not os.path.exists(path) or os.path.getsize(path) == 0:
-        raise RuntimeError("pyttsx3 no genero audio.")
+        raise RuntimeError("SAPI no genero audio.")
 
     return path
 
@@ -660,14 +754,14 @@ def load_pcm(path):
         return wav.readframes(frames)
 
 
-def speak(ser, engine, text):
+def speak(ser, voice, text):
 
     raw_path = None
     pcm_path = None
 
     try:
 
-        raw_path = create_tts_wav(engine, text)
+        raw_path = create_tts_wav(voice, text)
         pcm_path = convert_audio(raw_path)
         pcm = load_pcm(pcm_path)
 
@@ -680,23 +774,30 @@ def speak(ser, engine, text):
                 os.remove(path)
 
 
-def build_tts_engine():
+def build_tts_voice():
 
-    engine = pyttsx3.init()
+    voice = CreateObject("SAPI.SpVoice")
 
-    for voice in engine.getProperty("voices"):
+    tokens = voice.GetVoices()
+    chosen = None
 
-        if VOICE_MATCH.upper() in voice.id.upper():
-            engine.setProperty("voice", voice.id)
-            print("Voz:", voice.name)
+    for index in range(tokens.Count):
+
+        token = tokens.Item(index)
+
+        if VOICE_MATCH.upper() in token.Id.upper():
+            chosen = token
             break
 
+    if chosen is not None:
+        voice.Voice = chosen
+        print("Voz:", chosen.GetDescription())
     else:
         print(f"Aviso: no encontre voz con {VOICE_MATCH} - usando la de por defecto.")
 
-    engine.setProperty("rate", VOICE_RATE)
+    voice.Rate = VOICE_RATE
 
-    return engine
+    return voice
 
 
 # ======================================================
@@ -730,7 +831,7 @@ def main():
 
     print("Whisper listo.")
 
-    engine = build_tts_engine()
+    voice = build_tts_voice()
 
     ser = None
     session_id = None
@@ -762,11 +863,35 @@ def main():
 
             frame_type, payload = frame
 
+            if frame_type == UP_LEVEL:
+
+                # Telemetria de calibracion. El firmware calcula
+                # los umbrales sobre el ruido de fondo medido en
+                # vivo; esto deja ver esos numeros reales.
+                if SHOW_LEVELS and not recording and len(payload) >= 4:
+
+                    level, noise = struct.unpack("<HH", payload[:4])
+
+                    voice_th = max(int(noise * 3.0), 250)
+                    silence_th = max(int(noise * 1.8), 80)
+
+                    print(
+                        f"\r  nivel {level:6d} | ruido {noise:6d} "
+                        f"| voz>{voice_th:6d} | fin<{silence_th:6d}   ",
+                        end="",
+                        flush=True,
+                    )
+
+                continue
+
             if frame_type == UP_START:
 
                 audio = bytearray()
                 recording = True
 
+                # Salto de linea: la telemetria escribe con \r
+                # sin avanzar, asi no la sobreescribe.
+                print()
                 print("Escuchando...")
 
                 continue
@@ -843,7 +968,7 @@ def main():
 
             print(f'Kira dice: "{answer}"')
 
-            speak(ser, engine, answer)
+            speak(ser, voice, answer)
 
             # Descartar lo que el ESP32 haya podido enviar mientras
             # pensabamos, para no encolar frases viejas.
