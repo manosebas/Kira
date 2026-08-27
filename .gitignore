@@ -12,3 +12,7 @@
 # Notas internas: fuera del repo (siguen en disco local)
 /CLAUDE.md
 /HALLAZGOS.md
+
+# Python
+__pycache__/
+*.pyc
