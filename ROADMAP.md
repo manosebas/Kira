@@ -135,6 +135,34 @@ Después: **reiniciar, no tocar nada, y decir "Oye Kira"**. Ese es el examen fin
 - ⬜ **Decidir qué agentes queremos** y qué hace cada uno.
   Ideas: correo, calendario, casa (luces), notas y recordatorios, música.
 
+### Cómo funciona la orquestación (repasado antes de empezar)
+
+- El **raíz** es el orquestador. Cada **subagente** es un experto en un tema.
+- El raíz elige a quién delegar **leyendo la `description`** de cada subagente. Esa frase
+  es la tabla de enrutado: escrita mal, el enrutado falla.
+- Un subagente puede tener sus propias tools, skills, connections, sandbox y subagentes.
+  **No puede tener `channels/`** — los canales son solo del raíz, así que un experto no
+  tiene puerta propia: solo se le habla desde su padre.
+- **Varios expertos pueden correr a la vez** sin configurar nada: si el raíz los llama en la
+  misma respuesta, arrancan en paralelo.
+- Para coordinarlos con lógica (encadenar, pasar resultados, fan-out variable) existe la tool
+  `Workflow`, opt-in. **No la activamos todavía.**
+
+Detalle completo en `CLAUDE.md` sección 7.
+
+### Decisiones tomadas para arrancar
+
+- **Un experto con varias tools, no un experto por acción.** Los subagentes no heredan nada:
+  dos subagentes de correo necesitarían dos conexiones a Gmail configuradas aparte.
+- **Primero un experto sin credenciales** (notas o recordatorios en un archivo local) para
+  validar la mecánica sin pelearse con OAuth. Correo y calendario después.
+- **No activar `Workflow`** hasta tener tres o cuatro expertos que haga falta coordinar.
+- **No borrar el subagente `prueba`** hasta que el primer experto real funcione: es lo único
+  que prueba la cadena completa sin depender de nada externo, y sirve para saber si un fallo
+  está en la cadena o en el agente nuevo.
+- **Nada de pipelines largos para respuestas por voz.** Un planner → research → writer son
+  20-60 s de silencio. Los trabajos largos piden que Kira confirme y avise después.
+
 - ⬜ **Agente de correo.** Leer, buscar y enviar.
   Un solo subagente con varias herramientas, no uno por acción: cada subagente necesita su
   propia conexión a Gmail y duplicar eso no aporta nada.
